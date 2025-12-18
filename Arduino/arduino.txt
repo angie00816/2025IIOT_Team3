@@ -1,0 +1,193 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include "HX711.h"
+
+// ============ 第一組設備腳位 ============
+const int HX1_DOUT = 3;
+const int HX1_SCK  = 2;
+const int RED1_PIN   = 8;
+const int GREEN1_PIN = 9;
+#define RFID1_SS_PIN  5
+
+// ============ 第二組設備腳位 ============
+const int HX2_DOUT = 4;
+const int HX2_SCK  = 13;  // 第二組 HX711 SCK 接 D13
+const int RED2_PIN   = 10;
+const int GREEN2_PIN = 11;
+#define RFID2_SS_PIN  6
+
+// ============ 共用 RFID RST 腳位 ============
+#define RFID_RST_PIN 7  // 兩個 RFID 共用同一個 RST
+
+// ============ 共用設定 ============
+const bool LED_ACTIVE_HIGH = true;
+const float CALIBRATION_FACTOR = 100000.0f;
+const float TARGET_WEIGHT_G = 0.5f;  // 門檻：0.5 公克
+
+// 第一組允許的兩個 UID
+const byte UID_1[4] = {0xD0, 0xE0, 0x89, 0x10};
+const byte UID_2[4] = {0xC3, 0x35, 0x61, 0x10};
+
+// 第二組允許的單一 UID
+const byte UID_2_SINGLE[4] = {0xA3, 0x06, 0x8C, 0xF5};
+
+// ============ 物件實例 ============
+MFRC522 rfid1(RFID1_SS_PIN, RFID_RST_PIN);
+MFRC522 rfid2(RFID2_SS_PIN, RFID_RST_PIN);
+HX711 scale1;
+HX711 scale2;
+
+bool toggle1 = false;  // 第一組授權狀態
+bool toggle2 = false;  // 第二組授權狀態
+
+// ============ LED 控制 ============
+inline void driveLed(int pin, bool on) {
+  if (LED_ACTIVE_HIGH) digitalWrite(pin, on ? HIGH : LOW);
+  else                 digitalWrite(pin, on ? LOW : HIGH);
+}
+
+void setLedPair(int redPin, int greenPin, bool greenOn) {
+  driveLed(redPin, !greenOn);
+  driveLed(greenPin, greenOn);
+}
+
+// ============ 打印 UID ============
+void printUID(const byte *uidBytes, byte uidSize, const char *prefix) {
+  Serial.print(prefix);
+  Serial.print(" UID: ");
+  for (byte i = 0; i < uidSize; i++) {
+    if (uidBytes[i] < 0x10) Serial.print("0");
+    Serial.print(uidBytes[i], HEX);
+    if (i < uidSize - 1) Serial.print(":");
+  }
+  Serial.print(" (程式碼格式: {0x");
+  for (byte i = 0; i < uidSize; i++) {
+    if (uidBytes[i] < 0x10) Serial.print("0");
+    Serial.print(uidBytes[i], HEX);
+    if (i < uidSize - 1) Serial.print(", 0x");
+  }
+  Serial.println("})");
+}
+
+// ============ RFID 卡片比對（第一組）============
+bool uidMatches1(const byte *uidBytes, byte uidSize) {
+  if (uidSize != 4) return false;
+  bool match1 = true, match2 = true;
+  for (int i = 0; i < 4; ++i) {
+    if (uidBytes[i] != UID_1[i]) match1 = false;
+    if (uidBytes[i] != UID_2[i]) match2 = false;
+  }
+  return match1 || match2;
+}
+
+// ============ RFID 卡片比對（第二組，單一 UID）============
+bool uidMatches2(const byte *uidBytes, byte uidSize) {
+  if (uidSize != 4) return false;
+  for (int i = 0; i < 4; ++i) {
+    if (uidBytes[i] != UID_2_SINGLE[i]) return false;
+  }
+  return true;
+}
+
+// ============ 處理 RFID 卡片切換（第一組）============
+void checkCardAndToggle1(MFRC522 &reader, bool &toggleState, const char *tagName) {
+  if (reader.PICC_IsNewCardPresent() && reader.PICC_ReadCardSerial()) {
+    if (uidMatches1(reader.uid.uidByte, reader.uid.size)) {
+      toggleState = !toggleState;
+      Serial.print(tagName);
+      Serial.print(" 感測到合法卡，授權狀態切換為：");
+      Serial.println(toggleState ? "TRUE" : "FALSE");
+    } else {
+      Serial.print(tagName);
+      Serial.println(" 偵測到卡片，但 UID 不符");
+    }
+    reader.PICC_HaltA();
+  }
+}
+
+// ============ 處理 RFID 卡片切換（第二組）============
+void checkCardAndToggle2(MFRC522 &reader, bool &toggleState, const char *tagName) {
+  if (reader.PICC_IsNewCardPresent() && reader.PICC_ReadCardSerial()) {
+    if (uidMatches2(reader.uid.uidByte, reader.uid.size)) {
+      toggleState = !toggleState;
+      Serial.print(tagName);
+      Serial.print(" 感測到合法卡，授權狀態切換為：");
+      Serial.println(toggleState ? "TRUE" : "FALSE");
+    } else {
+      Serial.print(tagName);
+      Serial.println(" 偵測到卡片，但 UID 不符");
+    }
+    reader.PICC_HaltA();
+  }
+}
+
+// ============ 初始化 ============
+void setup() {
+  Serial.begin(9600);
+  // while (!Serial);
+
+  pinMode(RED1_PIN, OUTPUT);
+  pinMode(GREEN1_PIN, OUTPUT);
+  pinMode(RED2_PIN, OUTPUT);
+  pinMode(GREEN2_PIN, OUTPUT);
+
+  setLedPair(RED1_PIN, GREEN1_PIN, false);
+  setLedPair(RED2_PIN, GREEN2_PIN, false);
+
+  Serial.println("--- 第一組 HX711 初始化 ---");
+  scale1.begin(HX1_DOUT, HX1_SCK);
+  scale1.set_scale(CALIBRATION_FACTOR);
+  scale1.tare();
+
+  Serial.println("--- 第二組 HX711 初始化 ---");
+  scale2.begin(HX2_DOUT, HX2_SCK);
+  scale2.set_scale(CALIBRATION_FACTOR);
+  scale2.tare();
+
+  Serial.println("--- RFID 初始化 ---");
+  SPI.begin();
+  rfid1.PCD_Init();
+  rfid2.PCD_Init();
+
+  Serial.println("兩組系統已啟動：感測到指定卡片會切換授權狀態，授權且重量 > 0.5g 則亮綠燈。");
+}
+
+// ============ 主迴圈 ============
+void loop() {
+  checkCardAndToggle1(rfid1, toggle1, "[系統1]");
+  checkCardAndToggle2(rfid2, toggle2, "[系統2]");
+
+  float weight1 = fabs(scale1.get_units());
+  float weight2 = fabs(scale2.get_units());
+
+  bool weightOK1 = weight1 > TARGET_WEIGHT_G;
+  bool weightOK2 = weight2 > TARGET_WEIGHT_G;
+
+  bool lamp1Green = toggle1 && weightOK1;
+  bool lamp2Green = toggle2 && weightOK2;
+
+  setLedPair(RED1_PIN, GREEN1_PIN, lamp1Green);
+  setLedPair(RED2_PIN, GREEN2_PIN, lamp2Green);
+
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 1000) {
+    Serial.print("[系統1] 授權=");
+    Serial.print(toggle1 ? "TRUE" : "FALSE");
+    Serial.print(", 重量=");
+    Serial.print(weight1, 1);
+    Serial.print("g, LED=");
+    Serial.println(lamp1Green ? "綠" : "紅");
+
+    Serial.print("[系統2] 授權=");
+    Serial.print(toggle2 ? "TRUE" : "FALSE");
+    Serial.print(", 重量=");
+    Serial.print(weight2, 1);
+    Serial.print("g, LED=");
+    Serial.println(lamp2Green ? "綠" : "紅");
+    Serial.println("---");
+
+    lastPrint = millis();
+  }
+
+  delay(200);
+}
